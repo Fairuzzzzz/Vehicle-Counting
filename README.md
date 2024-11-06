@@ -26,3 +26,10 @@ Ubah `video_path` sesuai dengan gambar dari video yang menjadi tumpuan koordinat
 ```bash
 python vehicle_counter.py
 ```
+
+### Installasi Requirements
+
+Install beberapa requirements nya dengan command
+```shell
+pip install -r requirements.txt
+```
