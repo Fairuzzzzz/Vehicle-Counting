@@ -1,9 +1,7 @@
 import json
-import yolov5
 import cv2
-import supervision as sv
-import torch
 import numpy as np
+from ultralytics import YOLO
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Set
 from collections import defaultdict
@@ -16,15 +14,57 @@ class LineCounterConfig:
     line_color: tuple = (255, 0, 0)
     line_thickness: int = 2
 
+class BoundingBoxTracker:
+    def __init__(self):
+        self.next_id = 0
+        self.tracked_objects = {}  # {track_id: (last_bbox, class_id, last_seen_frame)}
+        self.max_disappeared = 30  # Frames before considering object lost
+
+    def update(self, results, frame_count):
+        current_objects = {}
+
+        if len(results) > 0:
+            boxes = results[0].boxes
+            for box in boxes:
+                bbox = box.xyxy[0].cpu().numpy()  # Get box coordinates
+                class_id = int(box.cls)  # Get class id
+                confidence = float(box.conf)  # Get confidence score
+
+                center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+                matched = False
+
+                # Try to match with existing tracks
+                for track_id, (old_bbox, old_class, last_seen) in self.tracked_objects.items():
+                    old_center = ((old_bbox[0] + old_bbox[2]) / 2, (old_bbox[1] + old_bbox[3]) / 2)
+                    distance = np.sqrt((center[0] - old_center[0])**2 + (center[1] - old_center[1])**2)
+
+                    if distance < 50 and old_class == class_id:  # Threshold for matching
+                        current_objects[track_id] = (bbox, class_id, frame_count)
+                        matched = True
+                        break
+
+                # Create new track if no match found
+                if not matched:
+                    current_objects[self.next_id] = (bbox, class_id, frame_count)
+                    self.next_id += 1
+
+        # Update tracked_objects, removing stale tracks
+        self.tracked_objects = {
+            track_id: obj_data
+            for track_id, obj_data in current_objects.items()
+            if frame_count - obj_data[2] <= self.max_disappeared
+        }
+
+        return self.tracked_objects
+
 class LineCounter:
     def __init__(self, config: LineCounterConfig):
         self.config = config
         self.vehicle_count = 0
         self.previous_centers = {}
-        self.counted_objects = set()  # Track objects already counted for this line
+        self.counted_objects = set()
 
     def create_line(self, frame):
-        # Draw the line
         cv2.line(
             frame,
             self.config.start_point,
@@ -33,74 +73,36 @@ class LineCounter:
             self.config.line_thickness
         )
 
-        # Add line number label
-        label_x = (self.config.start_point[0] + self.config.end_point[0]) // 2
-        label_y = (self.config.start_point[1] + self.config.end_point[1]) // 2
-        cv2.putText(
-            frame,
-            f"Line {self.config.line_number}",
-            (label_x, label_y - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            self.config.line_color,
-            2
-        )
-
     def get_line_points(self):
         return np.array(self.config.start_point), np.array(self.config.end_point)
 
     def calculate_distance_to_line(self, point):
-        """Calculate the distance from a point to the line"""
         line_start, line_end = self.get_line_points()
-
-        # Line vector
         line_vec = line_end - line_start
-
-        # Vector from line start to point
         point_vec = np.array(point) - line_start
 
-        # Calculate distance
         line_length = np.linalg.norm(line_vec)
         if line_length == 0:
             return np.linalg.norm(point_vec)
 
-        # Project point_vec onto line_vec
         unit_line_vec = line_vec / line_length
         projection_length = np.dot(point_vec, unit_line_vec)
-
-        # Calculate perpendicular distance
         projection = line_start + unit_line_vec * projection_length
         distance = np.linalg.norm(np.array(point) - projection)
 
         return distance
 
     def is_near_line(self, point, threshold=30):
-        """Check if a point is near the line"""
         return self.calculate_distance_to_line(point) < threshold
 
-    def check_line_crossing(self, detection_id: int, bbox: tuple, class_id: int, confidence: float) -> bool:
-        """
-        Check if an object crosses the line, ensuring each object is counted only once
-        Args:
-            detection_id: unique identifier for the detection
-            bbox: bounding box coordinates (x1, y1, x2, y2)
-            class_id: class identifier of the detected object
-            confidence: detection confidence score
-        """
-        # Calculate center point of bounding box
+    def check_line_crossing(self, track_id: int, bbox: tuple) -> bool:
         center_x = int((bbox[0] + bbox[2]) / 2)
         center_y = int((bbox[1] + bbox[3]) / 2)
         center = (center_x, center_y)
 
-        # Create unique object identifier combining multiple attributes
-        object_id = f"{detection_id}_{class_id}_{int(confidence * 100)}"
-        track_id = f"{self.config.line_number}_{object_id}"
-
-        # If object is already counted for this line, skip it
-        if object_id in self.counted_objects:
+        if track_id in self.counted_objects:
             return False
 
-        # Check if object is near the line
         if not self.is_near_line(center):
             return False
 
@@ -119,9 +121,8 @@ class LineCounter:
         previous_side = np.cross(v1, v2_previous)
         current_side = np.cross(v1, v2_current)
 
-        # If line is crossed
         if previous_side * current_side < 0:
-            self.counted_objects.add(object_id)  # Mark object as counted
+            self.counted_objects.add(track_id)
             self.previous_centers[track_id] = center
             return True
 
@@ -134,39 +135,35 @@ class MultiLineCounter:
             config.line_number: LineCounter(config)
             for config in line_configs
         }
+        self.counts = defaultdict(int)  # {class_name: count}
 
     def create_lines(self, frame):
         for counter in self.line_counters.values():
             counter.create_line(frame)
 
-    def check_crossings(self, detection_id: int, bbox: tuple, class_id: int, confidence: float) -> List[int]:
+    def check_crossings(self, track_id: int, bbox: tuple, class_name: str) -> List[int]:
         crossed_lines = []
         for line_number, counter in self.line_counters.items():
-            if counter.check_line_crossing(detection_id, bbox, class_id, confidence):
+            if counter.check_line_crossing(track_id, bbox):
                 crossed_lines.append(line_number)
+                self.counts[class_name] += 1
         return crossed_lines
 
-    def get_counts(self) -> Dict[int, int]:
-        return {
-            line_number: counter.vehicle_count
-            for line_number, counter in self.line_counters.items()
-        }
+    def get_counts(self) -> Dict[str, int]:
+        return dict(self.counts)
 
 def load_line_coordinates(json_path: str, video_width: int, video_height: int) -> List[LineCounterConfig]:
     with open(json_path, 'r') as f:
         data = json.load(f)
 
-    # Get original image dimensions from JSON
     orig_width = data['image_width']
     orig_height = data['image_height']
 
-    # Calculate scaling factors
     scale_x = video_width / orig_width
     scale_y = video_height / orig_height
 
     configs = []
     for line in data['lines']:
-        # Scale coordinates to video dimensions
         start_x = int(line['start_point'][0] * scale_x)
         start_y = int(line['start_point'][1] * scale_y)
         end_x = int(line['end_point'][0] * scale_x)
@@ -180,47 +177,55 @@ def load_line_coordinates(json_path: str, video_width: int, video_height: int) -
         configs.append(config)
     return configs
 
-def draw_counts(frame: np.ndarray, counts: Dict[int, int]):
-    y_offset = 40
-    for line_number, count in sorted(counts.items()):
-        cv2.putText(
-            frame,
-            f"Line {line_number} Count: {count}",
-            (20, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2
-        )
-        y_offset += 40
+def draw_counts(frame: np.ndarray, counts: Dict[str, int]):
+    # Draw counts at the bottom of the frame
+    total_height = frame.shape[0]
+    x_offset = 20
+    y_position = total_height - 30  # 30 pixels from bottom
+
+    count_text = " | ".join([f"{class_name}: {count:02d}" for class_name, count in counts.items()])
+    cv2.putText(
+        frame,
+        count_text,
+        (x_offset, y_position),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (255, 255, 255),  # White text
+        2
+    )
 
 def main():
-    json_path = "british_line.json" # Update data json sesuai dengan data mu
-    video_path = "british_highway_traffic.mp4"  # Update video path sesuai dengan video mu
+    json_path = "gondo.json"  # Update with your JSON file
+    video_path = "Simpang_Gondo.mp4"  # Update with your video file
+    model_path = "bestv8.pt"  # Update with your YOLOv8 model path
+
+    # Load the video
     cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
 
-    # Load and scale line coordinates to video dimensions
+    # Load line configurations
     line_configs = load_line_coordinates(json_path, width, height)
-
-    # Initialize multi-line counter
     multi_counter = MultiLineCounter(line_configs)
+    tracker = BoundingBoxTracker()
 
-    # Load model
-    model = yolov5.load('best2.pt')
+    # Load YOLOv8 model
+    model = YOLO(model_path)
+    class_names = model.names  # Get class names from model
 
-    # Output video setup
-    output_path = "output_with_counter.mp4"
+    # Setup video writer
+    output_path = "output_gondo_with_counter.mp4"
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # Initialize annotators
-    box_annotator = sv.BoxAnnotator()
-    label_annotator = sv.LabelAnnotator()
+    # Define colors for different classes
+    class_colors = {
+        'car': (0, 0, 255),      # Red for cars
+        'motorcycle': (0, 255, 0),  # Green for motorcycles
+        'truck': (255, 0, 0),    # Blue for trucks
+        'bus': (255, 255, 0)     # Yellow for buses
+    }
 
     frame_count = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -233,37 +238,43 @@ def main():
         # Draw counting lines
         multi_counter.create_lines(frame)
 
-        # Detect objects
-        with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-            results = model(frame)
+        # Run YOLOv8 inference
+        results = model(frame, conf=0.25)  # Adjust confidence threshold as needed
+        tracked_objects = tracker.update(results, frame_count)
 
-        detections = sv.Detections.from_yolov5(results)
+        # Draw bounding boxes and process detections
+        for track_id, (bbox, class_id, _) in tracked_objects.items():
+            class_name = class_names[int(class_id)]
+            color = class_colors.get(class_name, (255, 255, 255))
 
-        # Process each detection
-        for i, (box, class_id, confidence) in enumerate(zip(detections.xyxy, detections.class_id, detections.confidence)):
-            # Check all line crossings
-            crossed_lines = multi_counter.check_crossings(i, box, int(class_id), confidence)
-            for line_number in crossed_lines:
-                multi_counter.line_counters[line_number].vehicle_count += 1
+            # Draw bounding box
+            cv2.rectangle(
+                frame,
+                (int(bbox[0]), int(bbox[1])),
+                (int(bbox[2]), int(bbox[3])),
+                color,
+                2
+            )
 
-        # Create labels with confidence
-        labels = [
-            f"{model.names[int(class_id)]} {confidence:.2f}"
-            for class_id, confidence in zip(detections.class_id, detections.confidence)
-        ]
+            # Draw label with track ID
+            label = f"{class_name}-{track_id}"
+            cv2.putText(
+                frame,
+                label,
+                (int(bbox[0]), int(bbox[1] - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
 
-        # Draw counts for all lines
+            # Check line crossings
+            multi_counter.check_crossings(track_id, bbox, class_name)
+
+        # Draw counts at the bottom
         draw_counts(frame, multi_counter.get_counts())
 
-        # Annotate frame
-        annotated_frame = box_annotator.annotate(scene=frame, detections=detections)
-        annotated_frame = label_annotator.annotate(
-            scene=annotated_frame,
-            detections=detections,
-            labels=labels
-        )
-
-        out.write(annotated_frame)
+        out.write(frame)
 
         frame_count += 1
         progress = (frame_count / total_frames) * 100
@@ -272,9 +283,9 @@ def main():
     cap.release()
     out.release()
 
-    print("\nFinal counts for each line:")
-    for line_number, count in multi_counter.get_counts().items():
-        print(f"Line {line_number}: {count} vehicles")
+    print("\nFinal counts:")
+    for class_name, count in multi_counter.get_counts().items():
+        print(f"{class_name}: {count} vehicles")
 
     print(f"\nProcessed video saved as {output_path}")
 

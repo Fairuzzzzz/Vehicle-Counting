@@ -9,23 +9,21 @@ from collections import defaultdict
 model = YOLO('bestv8.pt')
 
 # Initialize video capture
-video_path = "british_highway_traffic.mp4"
+video_path = "Simpang_Pingit.mp4"
 cap = cv2.VideoCapture(video_path)
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = int(cap.get(cv2.CAP_PROP_FPS))
 
 # Initialize video writer
-output_path = "output_british_with_counter_yolov8.mp4"
+output_path = "output_pingit_with_counter_yolov8.mp4"
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-# Initialize tracker
 tracker = sv.ByteTrack()
 
-# Initialize counters
 vehicle_counts = defaultdict(int)
-active_tracks = defaultdict(set)  # To keep track of active vehicles by class
+active_tracks = defaultdict(set)
 
 def custom_label(label: str, confidence: float | None, track_id: int | None) -> str:
     if confidence is not None and track_id is not None:
