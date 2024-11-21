@@ -62,6 +62,10 @@ class LineCounter:
         self.vehicle_count = 0
         self.previous_centers = {}
         self.counted_objects = set()
+        self.last_count_time = {}
+        self.count_cooldown = 30
+        self.center_history = defaultdict(list)
+        self.history_size = 3
 
     def create_line(self, frame):
         cv2.line(
@@ -91,13 +95,26 @@ class LineCounter:
 
         return distance
 
-    def is_near_line(self, point, threshold=30):
+    def is_near_line(self, point, threshold=15):
         return self.calculate_distance_to_line(point) < threshold
 
-    def check_line_crossing(self, track_id: int, bbox: tuple, class_name: str) -> bool:
+    def get_smooth_center(self, track_id, current_center):
+        self.center_history[track_id].append(current_center)
+        if len(self.center_history[track_id]) > self.history_size:
+            self.center_history[track_id].pop(0)
+        return np.mean(self.center_history[track_id], axis=0)
+
+    def check_line_crossing(self, track_id: int, bbox: tuple, class_name: str, frame_count: int) -> bool:
+        if track_id in self.last_count_time:
+            if frame_count - self.last_count_time[track_id] < self.count_cooldown:
+                return False
+
         center_x = int((bbox[0] + bbox[2]) / 2)
         center_y = int((bbox[1] + bbox[3]) / 2)
-        center = (center_x, center_y)
+        current_center = np.array([center_x, center_y])
+
+        smooth_center = self.get_smooth_center(track_id, current_center)
+        center = (int(smooth_center[0]), int(smooth_center[1]))
 
         if track_id in self.counted_objects:
             return False
@@ -109,13 +126,17 @@ class LineCounter:
             self.previous_centers[track_id] = center
             return False
 
-        previous_center = self.previous_centers[track_id]
-        current_center = np.array(center)
-        line_start, line_end = self.get_line_points()
+        previous_center = np.array(self.previous_centers[track_id])
 
+        min_movement = 10
+        movement_distance = np.linalg.norm(smooth_center - previous_center)
+        if movement_distance < min_movement:
+            return False
+
+        line_start, line_end = self.get_line_points()
         v1 = line_end - line_start
-        v2_previous = np.array(previous_center) - line_start
-        v2_current = current_center - line_start
+        v2_previous = previous_center - line_start
+        v2_current = smooth_center - line_start
 
         previous_side = np.cross(v1, v2_previous)
         current_side = np.cross(v1, v2_current)
@@ -123,6 +144,7 @@ class LineCounter:
         if previous_side * current_side < 0:
             self.counted_objects.add(track_id)
             self.previous_centers[track_id] = center
+            self.last_count_time[track_id] = frame_count
             return True
 
         self.previous_centers[track_id] = center
@@ -140,10 +162,10 @@ class MultiLineCounter:
         for counter in self.line_counters.values():
             counter.create_line(frame)
 
-    def check_crossings(self, track_id: int, bbox: tuple, class_name: str) -> List[int]:
+    def check_crossings(self, track_id: int, bbox: tuple, class_name: str, frame_count: int) -> List[int]:
         crossed_lines = []
         for line_number, counter in self.line_counters.items():
-            if counter.check_line_crossing(track_id, bbox, class_name):
+            if counter.check_line_crossing(track_id, bbox, class_name, frame_count):
                 crossed_lines.append(line_number)
                 self.counts[class_name] += 1
         return crossed_lines
@@ -192,10 +214,69 @@ def draw_counts(frame: np.ndarray, counts: Dict[str, int]):
         2
     )
 
+def draw_title(frame: np.ndarray):
+    title_text = "Vehicle Counter"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1
+    thickness = 2
+
+    (text_width, text_height), baseline = cv2.getTextSize(title_text, font, font_scale, thickness)
+
+    padding = 10
+    rect_x = 10
+    rect_y = 10
+    rect_width = text_width + (padding * 2)
+    rect_height = text_height + (padding * 2)
+
+    cv2.rectangle(frame,
+                 (rect_x, rect_y),
+                 (rect_x + rect_width, rect_y + rect_height),
+                 (0, 0, 0),
+                 -1)
+
+    text_x = rect_x + padding
+    text_y = rect_y + text_height + padding - 5
+    cv2.putText(frame,
+                title_text,
+                (text_x, text_y),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness)
+
+def draw_label(frame, bbox, label, color):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 2
+
+    (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+    padding = 5
+    rect_x = int(bbox[0])
+    rect_y = int(bbox[1] - text_height - (padding * 2))
+    rect_width = text_width + (padding * 2)
+    rect_height = text_height + (padding * 2)
+
+    cv2.rectangle(frame,
+                 (rect_x, rect_y),
+                 (rect_x + rect_width, rect_y + rect_height),
+                 (0, 0, 0),
+                 -1)
+
+    text_x = rect_x + padding
+    text_y = rect_y + text_height + padding - 2
+    cv2.putText(frame,
+                label,
+                (text_x, text_y),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness)
+
 def main():
-    json_path = "british.json"
-    video_path = "british_highway_traffic.mp4"
-    model_path = "bestv11.pt"
+    json_path = "wirobrajan.json"
+    video_path = "Wirobrajan.mp4"
+    model_path = "best2_11.pt"
 
     cap = cv2.VideoCapture(video_path)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -209,7 +290,7 @@ def main():
     model = YOLO(model_path)
     class_names = model.names
 
-    output_path = "output_british_with_counter_11.mp4"
+    output_path = "output_wirobrajan_with_counter_11.mp4"
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
@@ -232,6 +313,8 @@ def main():
         results = model(frame, conf=0.5)
         tracked_objects = tracker.update(results, frame_count)
 
+        draw_title(frame)
+
         for track_id, (bbox, class_id, _) in tracked_objects.items():
             class_name = class_names[int(class_id)]
             color = class_colors.get(class_name, (255, 255, 255))
@@ -245,17 +328,9 @@ def main():
             )
 
             label = f"{class_name}-{track_id}"
-            cv2.putText(
-                frame,
-                label,
-                (int(bbox[0]), int(bbox[1] - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2
-            )
+            draw_label(frame, bbox, label, color)
 
-            multi_counter.check_crossings(track_id, bbox, class_name)
+            multi_counter.check_crossings(track_id, bbox, class_name, frame_count)
 
         draw_counts(frame, multi_counter.get_counts())
         out.write(frame)
