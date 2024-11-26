@@ -215,14 +215,14 @@ def draw_counts(frame: np.ndarray, counts: Dict[str, int]):
     )
 
 def draw_title(frame: np.ndarray):
-    title_text = "Vehicle Counter"
+    title_text = "Augenio Datains Use Case Vehicle Counter"
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 1
+    font_scale = 0.7
     thickness = 2
 
     (text_width, text_height), baseline = cv2.getTextSize(title_text, font, font_scale, thickness)
 
-    padding = 10
+    padding = 5
     rect_x = 10
     rect_y = 10
     rect_width = text_width + (padding * 2)
@@ -273,10 +273,50 @@ def draw_label(frame, bbox, label, color):
                 (255, 255, 255),
                 thickness)
 
+def add_logo(frame, logo_path):
+    try:
+        # Baca logo
+        logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
+        if logo is None:
+            print(f"Warning: Could not load logo from {logo_path}")
+            return frame
+
+        # Resize logo
+        logo_width = 100
+        logo_height = 100
+        logo_resized = cv2.resize(logo, (logo_width, logo_height))
+
+        y_offset = frame.shape[0] - logo_height - 10
+
+        x_offset = frame.shape[1] - logo_width - 10
+
+        # Region of interest pada frame
+        roi = frame[y_offset:y_offset + logo_height, x_offset:x_offset + logo_width]
+
+        # Buat mask dari channel alpha logo
+        alpha_channel = logo_resized[:, :, 3] / 255.0
+        alpha_3channel = np.stack([alpha_channel] * 3, axis=-1)
+
+        # Hitung komponen foreground dan background
+        foreground = logo_resized[:, :, :3] * alpha_3channel
+        background = roi * (1 - alpha_3channel)
+
+        # Gabungkan foreground dan background
+        result = foreground + background
+
+        # Tempatkan hasil ke frame
+        frame[y_offset:y_offset + logo_height, x_offset:x_offset + logo_width] = result
+
+    except Exception as e:
+        print(f"Error adding logo: {str(e)}")
+
+    return frame
+
 def main():
-    json_path = "wirobrajan.json"
-    video_path = "Wirobrajan.mp4"
+    json_path = "british.json"
+    video_path = "british_highway_traffic.mp4"
     model_path = "best2_11.pt"
+    logo_path = "augenio.png"
 
     cap = cv2.VideoCapture(video_path)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -290,7 +330,7 @@ def main():
     model = YOLO(model_path)
     class_names = model.names
 
-    output_path = "output_wirobrajan_with_counter_11.mp4"
+    output_path = "output_british_with_counter_11.mp4"
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
@@ -314,6 +354,8 @@ def main():
         tracked_objects = tracker.update(results, frame_count)
 
         draw_title(frame)
+
+        frame = add_logo(frame, logo_path)
 
         for track_id, (bbox, class_id, _) in tracked_objects.items():
             class_name = class_names[int(class_id)]
