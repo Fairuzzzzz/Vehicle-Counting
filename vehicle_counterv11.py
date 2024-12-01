@@ -66,6 +66,8 @@ class LineCounter:
         self.count_cooldown = 30
         self.center_history = defaultdict(list)
         self.history_size = 3
+        self.object_classes = {}
+        self.counts = defaultdict(int)
 
     def create_line(self, frame):
         cv2.line(
@@ -143,6 +145,8 @@ class LineCounter:
 
         if previous_side * current_side < 0:
             self.counted_objects.add(track_id)
+            self.object_classes[track_id] = class_name
+            self.counts[class_name] += 1
             self.previous_centers[track_id] = center
             self.last_count_time[track_id] = frame_count
             return True
@@ -198,21 +202,32 @@ def load_line_coordinates(json_path: str, video_width: int, video_height: int) -
         configs.append(config)
     return configs
 
-def draw_counts(frame: np.ndarray, counts: Dict[str, int]):
+def draw_counts(frame: np.ndarray, line_counters: Dict[int, LineCounter]):
     total_height = frame.shape[0]
     x_offset = 20
-    y_position = total_height - 30
+    y_position = total_height - 60  # Posisi awal
 
-    count_text = " | ".join([f"{class_name}: {count:02d}" for class_name, count in counts.items()])
-    cv2.putText(
-        frame,
-        count_text,
-        (x_offset, y_position),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (255, 255, 255),
-        2
-    )
+    for line_number, counter in sorted(line_counters.items()):
+        counts = defaultdict(int)
+        for obj_id in counter.counted_objects:
+            class_name = counter.object_classes.get(obj_id, "unknown")
+            counts[class_name] += 1
+
+        count_text = f"Line {line_number}: " + " | ".join([
+            f"{class_name}: {count:02d}"
+            for class_name, count in counts.items()
+        ])
+
+        cv2.putText(
+            frame,
+            count_text,
+            (x_offset, y_position),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+        y_position += 30
 
 def draw_title(frame: np.ndarray):
     title_text = "Augenio Datains Use Case Vehicle Counter"
@@ -313,8 +328,8 @@ def add_logo(frame, logo_path):
     return frame
 
 def main():
-    json_path = "british.json"
-    video_path = "british_highway_traffic.mp4"
+    json_path = "wirobrajan.json"
+    video_path = "Wirobrajan.mp4"
     model_path = "best2_11.pt"
     logo_path = "augenio.png"
 
@@ -330,7 +345,7 @@ def main():
     model = YOLO(model_path)
     class_names = model.names
 
-    output_path = "output_british_with_counter_11.mp4"
+    output_path = "output_wirobrajan_with_counter_11.mp4"
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
@@ -344,6 +359,7 @@ def main():
     frame_count = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -354,9 +370,23 @@ def main():
         tracked_objects = tracker.update(results, frame_count)
 
         draw_title(frame)
-
         frame = add_logo(frame, logo_path)
 
+        # Gambar label nomor garis
+        for config in line_configs:
+            mid_x = (config.start_point[0] + config.end_point[0]) // 2
+            mid_y = (config.start_point[1] + config.end_point[1]) // 2
+            cv2.putText(
+                frame,
+                f"Line {config.line_number}",
+                (mid_x - 20, mid_y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                2
+            )
+
+        # Gambar bounding box tanpa label
         for track_id, (bbox, class_id, _) in tracked_objects.items():
             class_name = class_names[int(class_id)]
             color = class_colors.get(class_name, (255, 255, 255))
@@ -369,13 +399,12 @@ def main():
                 2
             )
 
-            label = f"{class_name}-{track_id}"
-            draw_label(frame, bbox, label, color)
-
             multi_counter.check_crossings(track_id, bbox, class_name, frame_count)
 
-        draw_counts(frame, multi_counter.get_counts())
+        # Update tampilan counting
+        draw_counts(frame, multi_counter.line_counters)
         out.write(frame)
+
 
         frame_count += 1
         progress = (frame_count / total_frames) * 100
@@ -384,11 +413,15 @@ def main():
     cap.release()
     out.release()
 
-    print("\nFinal counts:")
-    for class_name, count in multi_counter.get_counts().items():
-        print(f"{class_name}: {count} vehicles")
-
-    print(f"\nProcessed video saved as {output_path}")
+    print("\nFinal counts per line:")
+    for line_number, counter in sorted(multi_counter.line_counters.items()):
+        print(f"\nLine {line_number}:")
+        counts = defaultdict(int)
+        for obj_id in counter.counted_objects:
+            class_name = counter.object_classes.get(obj_id, "unknown")
+            counts[class_name] += 1
+        for class_name, count in counts.items():
+            print(f"{class_name}: {count} vehicles")
 
 if __name__ == "__main__":
     main()
